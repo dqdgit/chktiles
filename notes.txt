@@ -1,0 +1,5 @@
+#
+#
+#
+git remote add origin https://github.com/dqdgit/chktiles.git
+git push -u origin master
