@@ -7,8 +7,9 @@ import (
 	"strings"
 	"regexp"
 	"strconv"
-	"encoding/xml"
 	"path/filepath"
+	"crypto/md5"
+	"encoding/hex"
 	"github.com/pborman/getopt/v2"
 	"github.com/trustmaster/go-aspell"
   "github.com/antchfx/xmlquery"
@@ -30,55 +31,6 @@ const pxPerM = (0.0254 * pxPerIn)
 const minWidth = 80
 const minHeight = 80
 
-type Bag struct {
-	Items []string `xml:"li"` 
-}
-
-type Subject struct {
-	XMLName xml.Name
-	Bag Bag `xml:"Bag"`
-}
-
-type Work struct {
-	XMLName xml.Name
-	About string `xml:"about,attr"`
-	Subject Subject `xml:"subject"`
-	Identifier string `xml:"identifier"`
-}
-
-type Rdf struct {
-	XMLName xml.Name
-	Work Work `xml:"Work"`
-}
-
-type Metadata struct {
-	XMLName xml.Name
-	Id string `xml:"id,attr"`
-	Rdf Rdf `xml:"RDF"`
-}
-
-type Tspan struct {
-	XMLName xml.Name
-	Id string `xml:"id,attr"`
-	X string `xml:"x,attr"`
-	Y string `xml:"y,attr"`
-	InnerText string `xml:",innerxml"`
-}
-
-type Text struct {
-	XMLName xml.Name
-	Tspans []Tspan `xml:"tspan"`
-}
-
-type Svg struct {
-	Width string `xml:"width,attr"`
-	Height string `xml:"height,attr"`
-	ViewBox string `xml:"viewBox,attr"`
-	Metadata Metadata `xml:"metadata"`
-	Texts []Text `xml:"text"`
-	GroupedTexts []Text `xml:"any>text"`
-}
-
 var helpFlag bool
 var verboseFlag bool
 
@@ -86,7 +38,7 @@ func toFloat(s string) float64 {
 	re := regexp.MustCompile(`[^0-9\.]`)
 	f, err := strconv.ParseFloat(re.ReplaceAllString(s, ""), 64)
 	if err != nil {
-		fmt.Printf("toFloat: ERROR: unable to convert %q, %v\n", s, err)
+		fmt.Printf("toFloat\tERROR\tunable to convert %q, %v\n", s, err)
 	}
 	return f
 }
@@ -124,71 +76,88 @@ func usage() {
 	fmt.Printf("    <duplication-directory>    path to the directory tree to look for duplicates\n")
 }
 
-func printSvg(svg Svg) {
-	fmt.Printf("width: %q, height: %q, viewBox: %q\n", svg.Width, svg.Height, svg.ViewBox)
-	keywords := strings.Join(svg.Metadata.Rdf.Work.Subject.Bag.Items, ", ")
-	fmt.Printf("keywords: %s\n", keywords)
-	fmt.Printf("identifier: %s\n", svg.Metadata.Rdf.Work.Identifier)
-	//fmt.Println(svg)
+func printSvg(node *xmlquery.Node) {
+	var n *xmlquery.Node
+	n = xmlquery.FindOne(node, "//svg")
+	w := n.SelectAttr("width")
+	h := n.SelectAttr("height")
+	v := n.SelectAttr("viewBox")
+	fmt.Printf("  ** Width: %s, Height: %s, Viewbox: %s\n", w, h, v)
 }
 
-func parseSvg(reader io.Reader) (*Svg , error) {
-	svg := &Svg{}
-
-	decoder := xml.NewDecoder(reader)
-	if err := decoder.Decode(svg); err != nil {
-		fmt.Printf("parseSvg: \tERROR: could not parse svg %v\n", err)
-    return nil, err
+func parseSvg(reader io.Reader) (*xmlquery.Node , error) {
+	xmlDoc, err := xmlquery.Parse(reader)
+	if err != nil {
+		fmt.Printf("parseSvg: \tERROR\tcould not parse SVG file. %v\n", err)
+		return nil, err
 	}
 
-	return svg, nil
+	return xmlDoc, nil
 }
 
-func checkKeywords(path string, svg Svg) {
-  if len(svg.Metadata.Rdf.Work.Subject.Bag.Items) == 0 {
-		fmt.Printf("%q: \tERROR: keywords missing\n", path)
+func checkKeywords(path string, node *xmlquery.Node) {
+	var nodes []*xmlquery.Node
+	nodes = xmlquery.Find(node, "//rdf:li")
+	if len(nodes) == 0 {
+		fmt.Printf("%q\tERROR\tKeywords missing\n", path)
 	}
 }
 
-func checkSize(path string, svg Svg) {
-	w := toFloat(svg.Width)
-	h := toFloat(svg.Height)
+func checkSize(path string, node *xmlquery.Node) {
+	var n *xmlquery.Node
+	n = xmlquery.FindOne(node, "//svg")
+	w := toFloat(n.SelectAttr("width"))
+	h := toFloat(n.SelectAttr("height"))
+
 	if w < minWidth {
-		fmt.Printf("%q: \tERROR: width (%f) is too small\n", path, w)
+		fmt.Printf("%q\tERROR\tWidth (%f) is too small\n", path, w)
 	}
 
 	if h < minHeight {
-		fmt.Printf("%q: \tERROR: height (%f) is too small\n", path, h)
+		fmt.Printf("%q\tERROR\tHeight (%f) is too small\n", path, h)
 	}
 }
 
-func checkUnits(path string, svg Svg) {
-	if u := getUnitConversion(svg.Width); u != 1.0 {
-		fmt.Printf("%q: \tWARNING: width units are not px, %q\n", path, svg.Width)
+func checkUnits(path string, node *xmlquery.Node) {
+	var n *xmlquery.Node
+	n = xmlquery.FindOne(node, "//svg")
+	w := n.SelectAttr("width")
+	h := n.SelectAttr("height")
+
+	if u := getUnitConversion(w); u != 1.0 {
+		fmt.Printf("%q\tWARNING\tWidth units are not px, %q\n", path, w)
 	}
 
-	if u := getUnitConversion(svg.Height); u != 1.0 {
-		fmt.Printf("%q: \tWARNING: height units are not px, %q\n", path, svg.Height)
+	if u := getUnitConversion(h); u != 1.0 {
+		fmt.Printf("%q\tWARNING\tHeight units are not px, %q\n", path, h)
+	}	
+}
+
+func checkIdentifier(path string, node *xmlquery.Node) {
+	var n *xmlquery.Node
+	n = xmlquery.FindOne(node, "//dc:identifier")
+	if n == nil {
+		fmt.Printf("%q\tERROR\tIdentifier missing\n", path)		
 	}
 }
 
-func checkIdentifier(path string, svg Svg) {
-  if svg.Metadata.Rdf.Work.Identifier == "" {
-		fmt.Printf("%q: \tERROR: Identifier missing\n", path)
-	}
-}
-
-func checkKeywordSpelling(path string, svg Svg) {
+func checkKeywordSpelling(path string, node *xmlquery.Node) {
 	speller, err := aspell.NewSpeller(map[string]string{"lang": "en_US,"})
 	if err != nil {
-		fmt.Printf("checkKeywordSpelling: ERROR: %v\n", err)
+		fmt.Printf("checkKeywordSpelling\tERROR\t%v\n", err)
 		return
 	}
 	defer speller.Delete()
-	
-	keywords := svg.Metadata.Rdf.Work.Subject.Bag.Items
-	if len(keywords) == 0 {
-		return
+
+	var nodes []*xmlquery.Node
+	nodes = xmlquery.Find(node, "//rdf:li")
+	if len(nodes) == 0 {
+		return 
+	}
+
+	var keywords []string
+	for _, n := range nodes {
+		keywords = append(keywords, n.InnerText())
 	}
 
 	var misspelled []string
@@ -205,19 +174,113 @@ func checkKeywordSpelling(path string, svg Svg) {
 
 	if len(misspelled) > 0 {
 		s := strings.Join(misspelled, ", ")
-		fmt.Printf("%q: \tERROR: keywords misspelled: %s\n", path, s)
+		fmt.Printf("%q\tERROR\tKeywords misspelled: %s\n", path, s)
 	}
 }
 
-func checkTspanSpelling(path string, svg Svg) {
-	texts := svg.Texts
-	fmt.Printf("%q texts: %d, grouped texts: %d\n", path, len(texts), len(svg.GroupedTexts))
+func checkTspanSpelling(path string, node *xmlquery.Node) {
+	speller, err := aspell.NewSpeller(map[string]string{"lang": "en_US,"})
+	if err != nil {
+		fmt.Printf("checkKeywordSpelling\tERROR\t%v\n", err)
+		return
+	}
+	defer speller.Delete()
+
+	var nodes []*xmlquery.Node
+	nodes = xmlquery.Find(node, "//svg:tspan")
+	if len(nodes) == 0 {
+		return 
+	}
+
+	var tspans []string
+	for _, n := range nodes {
+		tspans = append(tspans, n.InnerText())
+	}
+
+	var misspelled []string
+	for _, tspan := range tspans {
+		if tspan != "" {
+			words := strings.Split(tspan, " ")
+			for _, word := range words {
+				if !speller.Check(strings.Replace(word, "/", "", -1)) {
+					misspelled = append(misspelled, word)
+				}
+			}
+		}
+	}
+
+	if len(misspelled) > 0 {
+		s := strings.Join(misspelled, ", ")
+		fmt.Printf("%q\tERROR\tText misspelled: %s\n", path, s)
+	}
+}
+
+func makeHash(path string) string {
+	f, err := os.Open(path)
+	if err != nil {
+		fmt.Printf("makeHash\tERROR\tunable to open %q, %v\n", path, err)
+		return ""
+	}
+  defer f.Close()
+
+	h := md5.New()
+	if _, err := io.Copy(h, f); err != nil {
+		fmt.Printf("makeHash\tERROR\tunable to create hash of %q, %v\n", path, err)
+		return ""
+	}
+
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func getFileSize(path string) int64 {
+	fi, err := os.Stat(path)
+	if err != nil {
+		fmt.Print("getFileSize\tERROR\tunable to get size of %q, %v\n", path, err)
+		return 0
+	}
+
+	return fi.Size()
+}
+
+func checkDuplicates(checkPath string, dupDir string, node *xmlquery.Node) {
+	aHash := makeHash(checkPath)
+	aBasename := filepath.Base(checkPath)
+	aSize := getFileSize(checkPath)
+
+	err := filepath.Walk(dupDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			fmt.Printf("checkDuplicates\tERROR\tunable to access %q, %v\n", path, err)
+			return err
+		}
+
+		if filepath.Ext(path) != ".svg" {
+			return nil
+		}
+
+		if aBasename == filepath.Base(path) {
+			fmt.Printf("%q\tWARNING\tduplicate file name %q\n", checkPath, path)
+		}
+
+		if aSize == getFileSize(path) {
+			fmt.Printf("%q\tWARNING\tduplicate file size %q\n", checkPath, path)
+		}
+
+		if aHash == makeHash(path) {
+			fmt.Printf("%q\tWARNING\tduplicate file hash %q\n", checkPath, path)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		fmt.Printf("checkDuplicates\tERROR\tunable to walk directory %q, %v\n", dupDir, err)
+	}
 }
 
 func checkTiles(checkDir string, dupDir string) error {
 	err := filepath.Walk(checkDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			fmt.Printf("checkTiles: \tERROR: unable to access path %q, %v\n", path, err)
+			fmt.Printf("checkTiles\tERROR\tunable to access path %q, %v\n", path, err)
 			return err
 		}
 
@@ -226,37 +289,38 @@ func checkTiles(checkDir string, dupDir string) error {
 		}
 
 		if verboseFlag {
-			fmt.Printf("checkTiles: %q\n", path)
+			fmt.Printf("checkTiles%q\n", path)
 		}
 
 		file, err := os.Open(path)
 		if err != nil {
-			fmt.Printf("checkTiles: \tERROR: unable to open %q, %v\n", path, err)
+			fmt.Printf("checkTiles\tERROR\tunable to open %q, %v\n", path, err)
 			return err
 		}
 		defer file.Close()
 
-		svg, err := parseSvg(file)
+		rootNode, err := parseSvg(file)
 		if err != nil {
 			return err
 		}
 
 		if verboseFlag {
-			printSvg(*svg)
+			printSvg(rootNode)
 		}
 
-		checkKeywords(path, *svg)
-		checkSize(path, *svg)
-		checkUnits(path, *svg)
-		checkIdentifier(path, *svg)
-		checkKeywordSpelling(path, *svg)
-		checkTspanSpelling(path, *svg)
+		checkKeywords(path, rootNode)
+		checkSize(path, rootNode)
+		checkUnits(path, rootNode)
+		checkIdentifier(path, rootNode)
+		checkKeywordSpelling(path, rootNode)
+		checkTspanSpelling(path, rootNode)
+		checkDuplicates(path, dupDir, rootNode)
 
 		return nil
 	})
 
 	if err != nil {
-		fmt.Printf("checkTiles: \tERROR: unable to walk directory %q, %v\n", checkDir, err)
+		fmt.Printf("checkTiles\tERROR\tunable to walk directory %q, %v\n", checkDir, err)
 	}
 
 	return err
